@@ -109,6 +109,9 @@ class LSTMModel(PredictModel):
         if df is None:
             return 
         inputs, outputs = self._preprocess_data_reserve(df.values.T)
+        
+        # TODO 归一化数据 
+        # TODO 预测单个负载 尝试
 
         # 将数据分为 训练集和验证集
         val_len = int(inputs.shape[0] / 5)
@@ -170,4 +173,4 @@ class LSTMModel(PredictModel):
         pass
 if __name__ == "__main__":
     lstm_model = LSTMModel()
-    lstm_model.train_model(ResourceQuery.CPU)
+    lstm_model.train_model(ResourceQuery.MEM)
