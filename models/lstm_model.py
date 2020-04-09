@@ -5,6 +5,8 @@ import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import random
+
 import numpy as np
 import pandas as pd
 from matplotlib import pyplot
@@ -15,6 +17,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error
 
 # Importing the Keras libraries and packages for LSTM
+from keras import optimizers
 from keras.models import Sequential
 from keras.layers import Dense
 from keras.layers import LSTM
@@ -45,7 +48,7 @@ def create_dataset(dataset, look_back=30, n_out=30):
 def data_split(inputs, outputs,val_ratio=0.20):
     '''将输入输出 划分为训练集和验证集
     '''
-    val_len = int(len(ins)*val_ratio)
+    val_len = int(len(inputs)*val_ratio)
 
     train_inputs = inputs[:-val_len]
     val_inputs = inputs[-val_len:]
@@ -60,7 +63,7 @@ class LSTMModel(PredictModel):
     def __init__(self):
         pass
 
-    def _preprocess_data(self, data_origin):
+    def _preprocess_data(self, resource_query:ResourceQuery, data_origin):
         """ 将 data_origin 进行预处理，获得模型的输入输出
         将 data_origin 通过窗口移动，得到输入输出，将问题转化为监督问题
 
@@ -76,7 +79,7 @@ class LSTMModel(PredictModel):
         data_norm = max_min.fit_transform(data_origin)
         data = data_norm.T
 
-        pkl_path = self._checkpoints_dir + "lstm_scaler.pkl"
+        pkl_path = self._checkpoints_dir + "lstm_scaler_"+resource_query.name+".pkl"
         try:
             with open(pkl_path, "wb+") as f:
                 pickle.dump(max_min, f)
@@ -122,7 +125,6 @@ class LSTMModel(PredictModel):
         
         return np.array(inputs), np.array(outputs)
 
-
     def _preprocess_data_reserve(self, data):
         """ 将 data 进行预处理，获得模型的输入输出
         将 data 通过窗口移动，得到输入输出，将问题转化为监督问题
@@ -151,13 +153,24 @@ class LSTMModel(PredictModel):
         des_model = "_"+resource_query.name+"_"+\
             str(LSTM_UNITS)+"_"+str(LSTM_BATH_SIZE)+"_"+str(LSTM_EPOCHS)
 
-        _file_name = "./checkpoints/"+"lstm"+des_model+".h5"
+        _file_name = self._checkpoints_dir +"lstm"+des_model+".h5"
         model.save(_file_name)
-
 
     def _load_model(self, resource_query:ResourceQuery):
         # 加载模型
-        pass
+        des_model = "_"+resource_query.name+"_"+\
+            str(LSTM_UNITS)+"_"+str(LSTM_BATH_SIZE)+"_"+str(LSTM_EPOCHS)
+        _file_name = self._checkpoints_dir +"lstm"+des_model+".h5"
+        f = h5py.File(_file_name,'r+')
+
+        # 防止训练模型由于版本原因不兼容
+        data_p = f.attrs['training_config']
+        data_p = data_p.decode().replace("learning_rate","lr").encode()
+        f.attrs['training_config'] = data_p
+        f.close()
+        model = load_model(_file_name)
+
+        return model
 
     def _build_model_one_step(self, workloads_num:int):
         '''序列到序列堆叠式LSTM模型 
@@ -179,9 +192,11 @@ class LSTMModel(PredictModel):
         # Adding the output layer
         model.add(Dense(units = PRED_PERIOD))
         # Compiling the RNN
-        adam = optimizers.Adam(lr=0.001, beta_1=0.9, beta_2=0.999, epsilon=None, decay=0.9, amsgrad=False)
+        # adam = optimizers.Adam(lr=0.001, beta_1=0.9, beta_2=0.999, epsilon=None, decay=0.9, amsgrad=False)
 
-        model.compile(optimizer=adam, loss='mse')
+        # model.compile(optimizer=adam, loss='mse')
+        sgd = optimizers.SGD(lr=0.01, clipvalue=0.5)
+        model.compile(optimizer=sgd, loss='mse')
         return model
 
     def train_model(self, resource_query:ResourceQuery):
@@ -192,10 +207,10 @@ class LSTMModel(PredictModel):
 
         workloads_list = df.columns
         
-        inputs, outputs = self._preprocess_data(df.values)
+        inputs, outputs = self._preprocess_data(resource_query, df.values)
 
         # 将数据分为 训练集和验证集
-        val_len = int(inputs.shape[0] / 5)
+        val_len = int(len(inputs) / 5)
         train_inputs = inputs[:-val_len]
         val_inputs = inputs[-val_len:]
         train_outputs = outputs[:-val_len]
@@ -211,13 +226,49 @@ class LSTMModel(PredictModel):
         
         self._save_model(resource_query, model)
 
-        self.visual_fit(resource_query, model, val_inputs, val_outputs, workloads_list)
+        self.visual_fit(resource_query, val_inputs, val_outputs, workloads_list, model)
 
         self.visual_history(resource_query, history)
 
-    def visual_fit(self, resource_query:ResourceQuery, model, val_inputs, val_outputs, workloads_list):
+    def visual_fit(self, resource_query:ResourceQuery, val_inputs, val_outputs, \
+        workloads_list, model=None, scaler=None):
+        if model is None:
+            model = self._load_model(resource_query)
+        
+        if scaler is None:
+            pkl_path = self._checkpoints_dir + "lstm_scaler_"+resource_query.name+".pkl"
+            try:
+                with open(pkl_path, 'rb') as f:
+                    scaler = pickle.load(f)
+            except:
+                logger.error("prophet model load error")
+                return
+        
+        # 准备预测数据， 随机挑选一个样本
+        sampel_nums = len(val_inputs)
+        workload_nums = len(workloads_list)
+        plot_nums = 5
 
-        pass
+        sample_index = np.random.randint(sampel_nums)
+        data_input = val_inputs[sample_index:sample_index+1]
+        data_output = val_outputs[sample_index:sample_index+1]
+
+        data_predict = model.predict(data_input)
+
+        workload_indexs = np.random.randint(workload_nums, size=plot_nums)
+
+        for _index in workload_indexs:
+
+            pyplot.figure()
+            # pyplot.plot(origin_x, origin_y, color="blue", label="origin_data")
+            # pyplot.plot(fit_x, fit_y, color="red", label="fit_data")
+            # plt.title(workloads_list[_index])
+            # pyplot.legend(loc='upper left')
+            des_model = "_"+resource_query.name+"_"+str(LSTM_UNITS)+"_"+str(LSTM_BATH_SIZE)+"_"+str(LSTM_EPOCHS)
+            des_png = workloads_list[_index]+des_model
+            pyplot.savefig(self._checkpoints_dir+des_png+".png")
+
+
 
     
     def visual_history(self, resource_query:ResourceQuery, history):
@@ -233,7 +284,7 @@ class LSTMModel(PredictModel):
 
         des_model = "_"+resource_query.name+"_"+\
             str(LSTM_UNITS)+"_"+str(LSTM_BATH_SIZE)+"_"+str(LSTM_EPOCHS)
-        pyplot.savefig("./checkpoints/lstm_history"+des_model+".png")
+        pyplot.savefig(self._checkpoints_dir + "lstm_history"+des_model+".png")
 
 
     def predict(self, start:int, resource_query:ResourceQuery, namespace, workload):
